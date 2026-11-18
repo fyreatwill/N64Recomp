@@ -250,11 +250,28 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     };
 
     auto print_func_call_by_register = [&](int reg) {
+        // s7506: MIPS reads the jr/jalr target register before the delay slot executes. If the slot writes that
+        // register, latch it first; otherwise emit exactly as before so all other output stays byte-identical.
+        bool slot_writes_reg = false;
+        if (reg != 0 && instr_index + 1 < instructions.size()) {
+            const auto& slot = instructions[instr_index + 1];
+            slot_writes_reg = (slot.modifiesRd() && (int)slot.GetO32_rd() == reg) ||
+                              (slot.modifiesRt() && (int)slot.GetO32_rt() == reg);
+        }
+        if (slot_writes_reg) {
+            fmt::print("[Info] jr/jalr delay slot writes target reg in {} at 0x{:08X}, latching\n", func.name, instr_vram);
+            print_indent();
+            generator.emit_latch_jump_register(instr_vram, reg);
+        }
         if (!process_delay_slot(false)) {
             return false;
         }
         print_indent();
-        generator.emit_function_call_by_register(reg);
+        if (slot_writes_reg) {
+            generator.emit_function_call_by_latched_register(instr_vram, reg);
+        } else {
+            generator.emit_function_call_by_register(reg);
+        }
         print_link_branch();
         return true;
     };
@@ -305,8 +322,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
                 switch (jal_result) {
                     case JalResolutionResult::NoMatch:
-                        fmt::print(stderr, "No function found for jal target: 0x{:08X}\n", target_func_vram);
-                        return false;
+                        // Defer to a runtime lookup so a bogus jal target (data
+                        // misclassified as code) only fails if actually executed.
+                        fmt::print(stderr, "No function found for jal target: 0x{:08X} in {}, using runtime lookup\n", target_func_vram, func.name);
+                        call_by_lookup = true;
+                        break;
                     case JalResolutionResult::Match:
                         jal_target_name = context.functions[matched_func_index].name;
                         break;
@@ -412,6 +432,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     switch (instr_id) {
     case InstrId::cpu_nop:
+    // Cache maintenance is a no-op for recompiled code.
+    case InstrId::cpu_cache:
         fmt::print(output_file, "\n");
         break;
     // Cop0 (Limited functionality)
@@ -424,8 +446,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_cop0_status_read(rt);
                 break;
             default:
-                fmt::print(stderr, "Unhandled cop0 register in mfc0: {}\n", (int)reg);
-                return false;
+                fmt::print(stderr, "Unhandled cop0 register in mfc0: {} in {}, emitting trap\n", (int)reg, func.name);
+                print_indent();
+                generator.emit_do_break(instr_vram);
+                break;
             }
             break;
         }
@@ -438,8 +462,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_cop0_status_write(rt);
                 break;
             default:
-                fmt::print(stderr, "Unhandled cop0 register in mtc0: {}\n", (int)reg);
-                return false;
+                fmt::print(stderr, "Unhandled cop0 register in mtc0: {} in {}, emitting trap\n", (int)reg, func.name);
+                print_indent();
+                generator.emit_do_break(instr_vram);
+                break;
             }
             break;
         }
@@ -480,8 +506,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     case InstrId::cpu_jalr:
         // jalr can only be handled with $ra as the return address register
         if (rd != (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
-            fmt::print(stderr, "Invalid return address reg for jalr: f{}\n", rd);
-            return false;
+            // Non-$ra jalr only shows up in data misclassified as code; trap.
+            fmt::print(stderr, "Invalid return address reg for jalr: f{} in {}, emitting trap\n", rd, func.name);
+            print_indent();
+            generator.emit_do_break(instr_vram);
+            break;
         }
         needs_link_branch = true;
         print_func_call_by_register(rs);
@@ -519,8 +548,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_return(context, func_index);
             }
             else {
-                fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
-                return false;
+                // Branch into unmapped memory (data misclassified as code);
+                // trap at runtime instead of failing the recompile.
+                fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}, emitting trap\n", func.name, instr_vram, branch_target);
+                print_indent();
+                generator.emit_do_break(instr_vram);
             }
         }
         break;
@@ -568,6 +600,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         generator.emit_return(context, func_index);
         break;
     case InstrId::cpu_break:
+    // Invalid opcodes are usually data misclassified as code (e.g. splat
+    // fake_funcs); trap at runtime instead of failing the recompile.
+    case InstrId::cpu_INVALID:
         print_indent();
         generator.emit_do_break(instr_vram);
         break;
@@ -732,6 +767,23 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         handled = true;
     }
 
+    // movz/movn: conditional register move. rd = rs if (rt == 0) / (rt != 0).
+    if (instr_id == InstrId::cpu_movz || instr_id == InstrId::cpu_movn) {
+        static const ConditionalBranchOp movz_cond { BinaryOpType::Equal, {{ UnaryOpType::None, UnaryOpType::None }, { Operand::Rt, Operand::Zero }}, false, false };
+        static const ConditionalBranchOp movn_cond { BinaryOpType::NotEqual, {{ UnaryOpType::None, UnaryOpType::None }, { Operand::Rt, Operand::Zero }}, false, false };
+        static const UnaryOp mov_rd_rs { UnaryOpType::None, Operand::Rd, Operand::Rs };
+        // A write to $zero is architecturally a no-op (and would emit "0 = ...").
+        if (rd != 0) {
+            print_indent();
+            generator.emit_branch_condition(instr_id == InstrId::cpu_movz ? movz_cond : movn_cond, instruction_context);
+            print_indent();
+            generator.process_unary_op(mov_rd_rs, instruction_context);
+            print_indent();
+            generator.emit_branch_close();
+        }
+        handled = true;
+    }
+
     auto find_store_it = store_ops.find(instr_id);
     if (find_store_it != store_ops.end()) {
         print_indent();
@@ -746,8 +798,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     if (!handled) {
-        fmt::print(stderr, "Unhandled instruction: {}\n", instr.getOpcodeName());
-        return false;
+        // Usually data misclassified as code; trap at runtime instead of
+        // failing the whole recompile.
+        fmt::print(stderr, "Unhandled instruction: {} in {}, emitting trap\n", instr.getOpcodeName(), func.name);
+        print_indent();
+        generator.emit_do_break(instr_vram);
     }
 
     // TODO is this used?

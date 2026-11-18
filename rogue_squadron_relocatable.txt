@@ -1,0 +1,3 @@
+.ovl.mission
+.ovl.menu
+.ovl.cinematic

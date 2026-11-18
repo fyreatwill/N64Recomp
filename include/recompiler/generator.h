@@ -34,6 +34,10 @@ namespace N64Recomp {
         virtual void emit_function_end() const = 0;
         virtual void emit_function_call_lookup(uint32_t addr) const = 0;
         virtual void emit_function_call_by_register(int reg) const = 0;
+        // s7506: a jr/jalr whose delay slot overwrites the target register must read the register BEFORE the
+        // slot (MIPS semantics). Defaults keep the old (slot-first) behaviour for generators without temps.
+        virtual void emit_latch_jump_register(uint32_t instr_vram, int reg) const { (void)instr_vram; (void)reg; }
+        virtual void emit_function_call_by_latched_register(uint32_t instr_vram, int reg) const { (void)instr_vram; emit_function_call_by_register(reg); }
         // target_section_offset can each be deduced from symbol_index if the full context is available,
         // but for live recompilation the reference symbol list is unavailable so it's still provided.
         virtual void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const = 0;
@@ -73,6 +77,8 @@ namespace N64Recomp {
         void emit_function_end() const final;
         void emit_function_call_lookup(uint32_t addr) const final;
         void emit_function_call_by_register(int reg) const final;
+        void emit_latch_jump_register(uint32_t instr_vram, int reg) const final;
+        void emit_function_call_by_latched_register(uint32_t instr_vram, int reg) const final;
         void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const final;
         void emit_function_call(const Context& context, size_t function_index) const final;
         void emit_named_function_call(const std::string& function_name) const final;

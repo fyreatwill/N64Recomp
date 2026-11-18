@@ -110,6 +110,10 @@ std::unordered_map<InstrId, std::array<RspOperand, 3>> vector_operands{
     { InstrId::rsp_mfc2,    {RspOperand::Rt, RspOperand::Vs, RspOperand::None}},
     { InstrId::rsp_mtc2,    {RspOperand::Rt, RspOperand::Vs, RspOperand::None}},
 
+    // Rt, control reg index (vcO/vcc/vce)
+    { InstrId::rsp_cfc2,    {RspOperand::Rt, RspOperand::VsIndex, RspOperand::None}},
+    { InstrId::rsp_ctc2,    {RspOperand::Rt, RspOperand::VsIndex, RspOperand::None}},
+
     // Nop
     { InstrId::rsp_vnop,    {RspOperand::None, RspOperand::None, RspOperand::None}}
 };
@@ -121,22 +125,37 @@ std::string_view ctx_gpr_prefix(int reg) {
     return "";
 }
 
-uint32_t expected_c0_reg_value(int cop0_reg) {
+std::string expected_c0_reg_value(int cop0_reg) {
     switch (static_cast<Cop0Reg>(cop0_reg)) {
     case Cop0Reg::RSP_COP0_SP_STATUS:
-        return 0; // None of the flags in RSP status are set
+        return "0"; // None of the flags in RSP status are set
     case Cop0Reg::RSP_COP0_SP_DMA_FULL:
-        return 0; // Pretend DMAs complete instantly
+        return "0"; // Pretend DMAs complete instantly
     case Cop0Reg::RSP_COP0_SP_DMA_BUSY:
-        return 0; // Pretend DMAs complete instantly
+        return "0"; // Pretend DMAs complete instantly
     case Cop0Reg::RSP_COP0_SP_SEMAPHORE:
-        return 0; // Always acquire the semaphore
+        return "0"; // Always acquire the semaphore
+    // Graphics ucodes (e.g. Factor 5's) poll the RDP registers directly;
+    // route them to the host DPC bridge macros (see rsp_dpc_macros.h in
+    // consumers that force-include it).
+    case Cop0Reg::RSP_COP0_DPC_END:
+        return "RSP_DPC_END_READ()";
+    case Cop0Reg::RSP_COP0_DPC_CURRENT:
+        return "RSP_DPC_CURRENT_READ()";
     case Cop0Reg::RSP_COP0_DPC_STATUS:
-        return 0; // Good enough for the microcodes that would be recompiled (i.e. non-graphics ones)
+        return "RSP_DPC_STATUS_READ()";
+    case Cop0Reg::RSP_COP0_DPC_CLOCK:
+        return "RSP_DPC_CLOCK_READ()";
+    case Cop0Reg::RSP_COP0_DPC_BUFBUSY:
+        return "RSP_DPC_BUFBUSY_READ()";
+    case Cop0Reg::RSP_COP0_DPC_PIPEBUSY:
+        return "RSP_DPC_PIPEBUSY_READ()";
+    case Cop0Reg::RSP_COP0_DPC_TMEM:
+        return "RSP_DPC_TMEM_READ()";
     default:
         fmt::print(stderr, "Unhandled mfc0: {}\n", cop0_reg);
         throw std::runtime_error("Unhandled mfc0");
-        return 0;
+        return "0";
     }
 }
 
@@ -154,6 +173,13 @@ std::string_view c0_reg_write_action(int cop0_reg) {
         return "DO_DMA_READ";
     case Cop0Reg::RSP_COP0_SP_WR_LEN:
         return "DO_DMA_WRITE";
+    // RDP register writes go to the host DPC bridge (see rsp_dpc_macros.h).
+    case Cop0Reg::RSP_COP0_DPC_START:
+        return "RSP_DPC_START";
+    case Cop0Reg::RSP_COP0_DPC_END:
+        return "RSP_DPC_END";
+    case Cop0Reg::RSP_COP0_DPC_STATUS:
+        return "RSP_DPC_STATUS_WRITE";
     default:
         fmt::print(stderr, "Unhandled mtc0: {}\n", cop0_reg);
         throw std::runtime_error("Unhandled mtc0");
@@ -176,7 +202,8 @@ std::optional<int> get_rsp_element(const rabbitizer::InstructionRsp& instr) {
 }
 
 bool rsp_ignores_element(InstrId id) {
-    return id == InstrId::rsp_vmacq || id == InstrId::rsp_vnop;
+    return id == InstrId::rsp_vmacq || id == InstrId::rsp_vnop
+        || id == InstrId::rsp_cfc2 || id == InstrId::rsp_ctc2;
 }
 
 struct BranchTargets {
@@ -450,7 +477,11 @@ bool process_instruction(size_t instr_index, const std::vector<rabbitizer::Instr
             print_line("{}{} = {}{} < {}{} ? 1 : 0", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rs), rs, ctx_gpr_prefix(rt), rt);
             break;
         case InstrId::rsp_sltiu:
-            print_line("{}{} = {}{} < {} ? 1 : 0", ctx_gpr_prefix(rt), rt, ctx_gpr_prefix(rs), rs, signed_imm_string);
+            // s7093 (RS64): the immediate is sign-extended then compared UNSIGNED. With rs = $zero the left operand is
+            // the int literal 0, so `0 < -0X8000` was a signed int compare (0) where the RSP gives 1. Negative
+            // immediates are wrapped in U32() so the compare is unsigned whatever rs prints as; others are unchanged.
+            print_line("{}{} = {}{} < {} ? 1 : 0", ctx_gpr_prefix(rt), rt, ctx_gpr_prefix(rs), rs,
+                (int16_t)imm < 0 ? fmt::format("U32({})", signed_imm_string) : signed_imm_string);
             break;
             // Loads
             // TODO ld

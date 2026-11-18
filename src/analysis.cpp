@@ -146,13 +146,10 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
     case InstrId::cpu_sw:
         // If this is a store to the stack, copy the state of rt into the stack at the given offset
         if (base == (int)RegId::GPR_O32_sp) {
-            if ((imm & 0b11) != 0) {
-                fmt::print(stderr, "Invalid alignment on offset for sw to stack: {}\n", (int16_t)imm);
-                return false;
-            }
-            if (((int16_t)imm) < 0) {
-                fmt::print(stderr, "Negative offset for sw to stack: {}\n", (int16_t)imm);
-                return false;
+            // Unaligned/negative stack offsets appear in hand-written asm;
+            // they can't hold a tracked jump-table pointer, so skip tracking.
+            if ((imm & 0b11) != 0 || ((int16_t)imm) < 0) {
+                break;
             }
             size_t stack_offset = imm / 4;
             if (stack_offset >= stack_states.size()) {
@@ -166,13 +163,10 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
         temp.invalidate();
         // If this is a load from the stack, copy the state of the stack at the given offset to rt
         if (base == (int)RegId::GPR_O32_sp) {
-            if ((imm & 0b11) != 0) {
-                fmt::print(stderr, "Invalid alignment on offset for lw from stack: {}\n", (int16_t)imm);
-                return false;
-            }
-            if (((int16_t)imm) < 0) {
-                fmt::print(stderr, "Negative offset for lw from stack: {}\n", (int16_t)imm);
-                return false;
+            // Untracked slot (see sw case); leave rt invalidated.
+            if ((imm & 0b11) != 0 || ((int16_t)imm) < 0) {
+                reg_states[rt] = temp;
+                break;
             }
             size_t stack_offset = imm / 4;
             if (stack_offset >= stack_states.size()) {

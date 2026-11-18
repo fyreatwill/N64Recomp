@@ -1,0 +1,7 @@
+# Reconstructed config for Rogue Squadron (U) v1.0 recompilation.
+# ELF comes from rogue_squadron64/tools/make_elf.py.
+[input]
+entrypoint = 0x80000400
+elf_path = "../rogue_squadron64/build/roguesquadron.elf"
+output_func_path = "RecompiledFuncs"
+relocatable_sections_path = "rogue_squadron_relocatable.txt"
